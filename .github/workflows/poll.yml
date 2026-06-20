@@ -1,0 +1,28 @@
+# Poller on-chain de BTC (repo PÚBLICO → minutos GH ilimitados, gratis). Un barrido (--once) por disparo.
+# Disparo CONFIABLE: pg_cron (Supabase) hace repository_dispatch cada 30 min → corre al instante (NO el `schedule:`
+# best-effort, que se atrasaba/salteaba). `workflow_dispatch` queda para probar a mano.
+# Seedless + rol Postgres ACOTADO (btc_poller): aunque el repo sea público, el secreto es un conn string recortado.
+name: BTC on-chain poll
+
+on:
+  repository_dispatch:
+    types: [btc-poll]
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Poll (un barrido y salir)
+        run: node poller.mjs --once
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_CA_CERT: ${{ secrets.SUPABASE_CA_CERT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SPARK_NETWORK: ${{ vars.SPARK_NETWORK || 'MAINNET' }}
