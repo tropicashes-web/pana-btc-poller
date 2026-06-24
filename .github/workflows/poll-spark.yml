@@ -1,0 +1,28 @@
+# Poller de Spark→Spark ENTRANTE (repo PÚBLICO → minutos GH ilimitados, gratis). Un barrido (--spark) por disparo.
+# SEPARADO del on-chain (poll.yml): su propio dispatch `spark-poll` con cadencia más rápida (pg_cron ~1 min), porque
+# los transfers Spark son instantáneos (el on-chain queda en ~30 min, no se toca). `workflow_dispatch` p/ probar a mano.
+# Mismo worker `poller.mjs`, mismo rol ACOTADO btc_poller; solo cambia el flag → barrido `getPendingTransfers`.
+name: Spark incoming poll
+
+on:
+  repository_dispatch:
+    types: [spark-poll]
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Poll Spark→Spark (un barrido y salir)
+        run: node poller.mjs --once --spark
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_CA_CERT: ${{ secrets.SUPABASE_CA_CERT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SPARK_NETWORK: ${{ vars.SPARK_NETWORK || 'MAINNET' }}

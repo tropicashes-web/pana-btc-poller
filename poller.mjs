@@ -4,12 +4,16 @@
  *
  * Idéntico al `btc-wallet/poller.mjs` salvo la CAPA DB: en vez de PostgREST con la `service_role` key, se conecta
  * **directo a Postgres con el rol ACOTADO `btc_poller`** (grants mínimos: leer addresses + tocar
- * `btc_pending_deposits`; NADA de webhook_secret / email / resto de la BD). Por eso este repo puede ser público:
- * el único secreto es un connection string a un rol con permisos recortados.
+ * `btc_pending_deposits`/`spark_seen_transfers`; NADA de webhook_secret / email / resto de la BD). Por eso este repo
+ * puede ser público: el único secreto es un connection string a un rol con permisos recortados.
  *
- * SEEDLESS: solo lecturas públicas de Spark (`getUtxosForDepositAddress`) + Telegram. No toca material de derivación.
+ * SEEDLESS: solo lecturas públicas de Spark + Telegram. No toca material de derivación.
  *
- *   DATABASE_URL=postgres://btc_poller:…  SPARK_NETWORK=MAINNET  TELEGRAM_BOT_TOKEN=…  node poller.mjs --once
+ * DOS barridos INDEPENDIENTES (cada uno con su pg_cron→repository_dispatch, cadencias distintas):
+ *   `--once`   → depósitos on-chain  (`getUtxosForDepositAddress`, dispatch `btc-poll`, ~30min)
+ *   `--spark`  → Spark→Spark entrante (`getPendingTransfers`, dispatch `spark-poll`, ~1min)
+ *
+ *   DATABASE_URL=postgres://btc_poller:…  SPARK_NETWORK=MAINNET  TELEGRAM_BOT_TOKEN=…  node poller.mjs --once [--spark]
  */
 import { SparkReadonlyClient } from "@buildonspark/spark-sdk";
 import pg from "pg";
@@ -20,8 +24,16 @@ const WINDOW_S = Number(process.env.BTC_POLL_WINDOW_SECONDS ?? 1800);
 const TICK_MS = Number(process.env.BTC_POLL_TICK_MS ?? 60_000);
 // Columna de la deposit address por red. Constante CONTROLADA (whitelist abajo) → seguro interpolarla.
 const DEPOSIT_COL = NETWORK === "REGTEST" ? "static_deposit_address_regtest" : "static_deposit_address";
+// Columnas del barrido Spark→Spark por red (mismo criterio whitelist que DEPOSIT_COL → seguro interpolarlas).
+const SPARK_COL = NETWORK === "REGTEST" ? "spark_address_regtest" : "spark_address";
+const IDENTITY_COL = NETWORK === "REGTEST" ? "identity_pubkey_regtest" : "identity_pubkey";
 const CONCURRENCY = Number(process.env.BTC_POLL_CONCURRENCY ?? 25);
 const ONCE = process.argv.includes("--once");
+const SPARK = process.argv.includes("--spark"); // enruta a sweepAllSpark (dispatch `spark-poll`); el on-chain queda intacto
+
+// TransferType (proto) → categoría (igual que btc-wallet/src/spark.mjs): 0=LN · 1/3=on-chain · 2/30/40=Spark.
+const TYPE_CAT = { 0: "Lightning", 1: "On-chain", 2: "Spark", 3: "On-chain", 30: "Spark", 40: "Spark" };
+const bytesToHex = (u8) => Array.from(u8 ?? [], (b) => b.toString(16).padStart(2, "0")).join("");
 
 if (!DATABASE_URL) {
   console.error("[poller] falta DATABASE_URL (connection string del rol btc_poller)");
@@ -54,6 +66,11 @@ async function tgSend(chatId, text) {
 async function chatIdFor(address) {
   const rows = await q("select telegram_chat_id from public.users where address = $1", [address.toLowerCase()]).catch(() => []);
   return rows[0]?.telegram_chat_id ?? null;
+}
+// Como chatIdFor pero también trae el toggle `notify_incoming` (el sweep Spark SÍ lo respeta; default ON).
+async function chatPrefFor(address) {
+  const rows = await q("select telegram_chat_id, notify_incoming from public.users where address = $1", [address.toLowerCase()]).catch(() => []);
+  return { chatId: rows[0]?.telegram_chat_id ?? null, notifyIncoming: rows[0]?.notify_incoming ?? true };
 }
 
 // ── Stagger por buckets (modo daemon) ──
@@ -132,7 +149,71 @@ async function sweepAll() {
   console.log(`[poller] barrido completo: ${rows.length} direcciones (conc=${CONCURRENCY})`);
 }
 
-if (ONCE) {
+// ── Spark→Spark entrante: getPendingTransfers (seedless) → filtra Spark + no-self → dedup → aviso UNA vez ──
+async function processSparkAddress(ro, address, sparkAddr, identityHex) {
+  if (!sparkAddr) return;
+  let pend;
+  try {
+    pend = await ro.getPendingTransfers(sparkAddr); // entrantes PENDIENTES (antes de que el receptor los reclame)
+  } catch (e) {
+    console.error(`[poller] getPendingTransfers ${address} falló:`, e.message);
+    return;
+  }
+  const incoming = (pend ?? []).filter((t) => {
+    if (TYPE_CAT[t.type] !== "Spark") return false; // solo Spark→Spark (LN tiene webhook; on-chain tiene su sweep)
+    if (identityHex && bytesToHex(t.senderIdentityPublicKey).toLowerCase() === identityHex) return false; // self-send
+    return true;
+  });
+  if (!incoming.length) return;
+  let pref = null;
+  for (const t of incoming) {
+    const ins = await q(
+      "insert into public.spark_seen_transfers (transfer_id, network) values ($1,$2) on conflict do nothing returning transfer_id",
+      [t.id, NETWORK],
+    ).catch((e) => {
+      console.error("[poller] dedup insert falló:", e.message);
+      return [{ transfer_id: null }]; // ante fallo de dedup, NO re-avisa en loop: tratamos como ya-visto
+    });
+    if (!ins.length) continue; // ya avisado (conflict)
+    if (pref === null) pref = await chatPrefFor(address);
+    const sats = Number(t.totalValue);
+    if (pref.notifyIncoming && pref.chatId) {
+      await tgSend(pref.chatId, `🟣 Received ${sats.toLocaleString("en-US")} sats via Spark`);
+    }
+    console.log(`[poller] ${address}: Spark transfer ${t.id} (${sats} sats) → ${pref.chatId ? "aviso" : "sin chat"}`);
+  }
+}
+
+// ── --spark (dispatch `spark-poll`): UN barrido de TODAS las spark addresses con pool de concurrencia ──
+async function sweepAllSpark() {
+  const rows = await q(
+    `select address, ${SPARK_COL} as spark, ${IDENTITY_COL} as identity from public.spark_wallets where ${SPARK_COL} is not null`,
+  );
+  let next = 0;
+  const worker = async () => {
+    while (next < rows.length) {
+      const r = rows[next++];
+      try {
+        await processSparkAddress(ro, r.address, r.spark, r.identity ? String(r.identity).toLowerCase() : null);
+      } catch (e) {
+        console.error(`[poller] spark ${r.address} falló:`, e.message);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, rows.length || 1) }, worker));
+  console.log(`[poller] barrido Spark completo: ${rows.length} direcciones (conc=${CONCURRENCY})`);
+}
+
+if (SPARK) {
+  // Dispatch `spark-poll` (cada ~1 min): barrido Spark→Spark, separado del on-chain. Siempre one-shot.
+  console.log(`[poller] --spark (Spark→Spark) · network=${NETWORK} · conc=${CONCURRENCY}`);
+  await sweepAllSpark().catch((e) => {
+    console.error("[poller] barrido Spark falló:", e.message);
+    process.exitCode = 1;
+  });
+  await db.end();
+  process.exit(process.exitCode ?? 0);
+} else if (ONCE) {
   console.log(`[poller] --once · network=${NETWORK} · conc=${CONCURRENCY}`);
   await sweepAll().catch((e) => {
     console.error("[poller] barrido falló:", e.message);
