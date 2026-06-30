@@ -11,7 +11,7 @@
  *
  * DOS barridos INDEPENDIENTES (cada uno con su pg_cron→repository_dispatch, cadencias distintas):
  *   `--once`   → depósitos on-chain  (`getUtxosForDepositAddress`, dispatch `btc-poll`, ~30min)
- *   `--spark`  → Spark→Spark entrante (`getPendingTransfers`, dispatch `spark-poll`, ~1min)
+ *   `--spark`  → Spark→Spark entrante (`getPendingTransfers`, dispatch `spark-poll`, ~5min)
  *
  *   DATABASE_URL=postgres://btc_poller:…  SPARK_NETWORK=MAINNET  TELEGRAM_BOT_TOKEN=…  node poller.mjs --once [--spark]
  */
@@ -63,11 +63,7 @@ async function tgSend(chatId, text) {
     console.error("[poller] telegram falló:", e.message);
   }
 }
-async function chatIdFor(address) {
-  const rows = await q("select telegram_chat_id from public.users where address = $1", [address.toLowerCase()]).catch(() => []);
-  return rows[0]?.telegram_chat_id ?? null;
-}
-// Como chatIdFor pero también trae el toggle `notify_incoming` (el sweep Spark SÍ lo respeta; default ON).
+// Trae el chat de Telegram + el toggle `notify_incoming` del usuario (default ON). Lo usan AMBOS sweeps (on-chain + Spark).
 async function chatPrefFor(address) {
   const rows = await q("select telegram_chat_id, notify_incoming from public.users where address = $1", [address.toLowerCase()]).catch(() => []);
   return { chatId: rows[0]?.telegram_chat_id ?? null, notifyIncoming: rows[0]?.notify_incoming ?? true };
@@ -99,18 +95,26 @@ async function processAddress(ro, address, deposit) {
 
   const fresh = [...current].filter((k) => !seen.has(k));
   if (fresh.length) {
+    let pref = null;
     for (const k of fresh) {
       const [txid, vout] = k.split(":");
-      await q(
-        "insert into public.btc_pending_deposits (address, network, txid, vout) values ($1,$2,$3,$4) on conflict do nothing",
+      // INSERT con `returning` = claim ATÓMICO: solo avisa quien GANÓ el insert → dos corridas solapadas (dispatch GH)
+      // NO duplican el aviso. Mismo patrón que `processSparkAddress`.
+      const ins = await q(
+        "insert into public.btc_pending_deposits (address, network, txid, vout) values ($1,$2,$3,$4) on conflict do nothing returning txid",
         [address, NETWORK, txid, Number(vout)],
-      );
+      ).catch((e) => {
+        console.error("[poller] insert depósito falló:", e.message);
+        return [{ txid: null }]; // ante fallo, tratamos como ya-visto (no re-avisar en loop)
+      });
+      if (!ins.length) continue; // otra corrida ya lo insertó → no re-avisar
+      // Respeta el toggle `notify_incoming` (el sweep on-chain lo IGNORABA; el Spark ya lo respetaba).
+      if (pref === null) pref = await chatPrefFor(address);
+      if (pref.notifyIncoming && pref.chatId) {
+        await tgSend(pref.chatId, "🟠 Bitcoin deposit received on-chain. Open PANA to claim it into Spark.");
+      }
+      console.log(`[poller] ${address}: depósito ${txid}:${vout} → ${pref.chatId ? "aviso" : "sin chat"}`);
     }
-    const chatId = await chatIdFor(address);
-    for (let i = 0; i < fresh.length; i++) {
-      await tgSend(chatId, "🟠 Bitcoin deposit received on-chain. Open PANA to claim it into Spark.");
-    }
-    console.log(`[poller] ${address}: ${fresh.length} depósito(s) nuevo(s) → aviso`);
   }
 
   const gone = [...seen].filter((k) => !current.has(k));
@@ -205,7 +209,7 @@ async function sweepAllSpark() {
 }
 
 if (SPARK) {
-  // Dispatch `spark-poll` (cada ~1 min): barrido Spark→Spark, separado del on-chain. Siempre one-shot.
+  // Dispatch `spark-poll` (cada ~5 min): barrido Spark→Spark, separado del on-chain. Siempre one-shot.
   console.log(`[poller] --spark (Spark→Spark) · network=${NETWORK} · conc=${CONCURRENCY}`);
   await sweepAllSpark().catch((e) => {
     console.error("[poller] barrido Spark falló:", e.message);
